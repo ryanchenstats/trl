@@ -43,6 +43,7 @@ from .kto_trainer import KTOTrainer
 from .model_config import ModelConfig
 from .ppo_config import PPOConfig
 from .ppo_trainer import PPOTrainer
+from .new_trainer import NEWTrainer
 from .reward_config import RewardConfig
 from .reward_trainer import RewardTrainer, compute_accuracy
 from .sft_trainer import SFTTrainer

@@ -106,7 +106,7 @@ outputs = model(**inputs, labels=inputs["input_ids"])
 """
 
 
-class PPOTrainer(BaseTrainer):
+class NEWTrainer(BaseTrainer):
     """
     The PPOTrainer uses Proximal Policy Optimization to optimise language models.
     Note, this trainer is heavily inspired by the original OpenAI learning to summarize work here:
