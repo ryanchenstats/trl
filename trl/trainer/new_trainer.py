@@ -428,6 +428,29 @@ class NEWTrainer(BaseTrainer):
         else:
             return dataset.remove_columns(ignored_columns)
 
+    def explore_expand_tensors(self, 
+                               query_tensor: torch.Tensor,
+                               num_to_explore: int = 1
+    ):
+        """
+        Generate the expanded queries. We repeat each query `num_to_explore` times. 
+        
+        Args:
+            query_tensor (`torch.LongTensor`):
+                A tensor of shape (unique prompts, input seq len)
+
+            num_to_explore (`int`):
+                Integer denoting how many times each prompt is to be repeated.
+                
+        Returns:
+            torch.LongTensor of input ids of shape (num_to_explore * unique_prompts, input_seq_len)
+            containing the repeated queries
+        """
+        
+        query_tensor = query_tensor.repeat_interleave(repeats=num_to_explore, dim=0)
+        return query_tensor
+        
+    
     def generate(
         self,
         query_tensor: Union[torch.Tensor, List[torch.Tensor]],
@@ -435,6 +458,7 @@ class NEWTrainer(BaseTrainer):
         batch_size: int = 4,
         return_prompt: bool = True,
         generate_ref_response: bool = False,
+        num_to_explore: int = 1,
         **generation_kwargs,
     ):
         """
@@ -460,6 +484,10 @@ class NEWTrainer(BaseTrainer):
         """
         if generate_ref_response:
             ref_model = self.model if self.is_peft_model else self.ref_model
+        
+        query_tensor = self.explore_expand_tensors(query_tensor=query_tensor, num_to_explore=num_to_explore)
+        query_tensor = list(query_tensor)
+        
         if isinstance(query_tensor, List):
             response = self._generate_batched(
                 self.model,
@@ -542,7 +570,7 @@ class NEWTrainer(BaseTrainer):
                 pad_to_multiple_of=pad_to_multiple_of,
                 return_tensors="pt",
             ).to(self.current_device)
-
+            
             generations = self.accelerator.unwrap_model(model).generate(**padded_inputs, **generation_kwargs)
 
             for generation, mask in zip(generations, padded_inputs["attention_mask"]):
