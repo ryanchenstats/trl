@@ -146,4 +146,4 @@ examples/notebooks/wandb/
 wandb/
 
 # unittest files
-unittest/
+unit_tests/

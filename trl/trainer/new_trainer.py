@@ -611,8 +611,8 @@ class NEWTrainer(BaseTrainer):
 
                 outputs['output_ids'].append(output)
             
-            for token_logits in list(generations.logits):
-                pass
+            for batch_item_number in range(batch_size):
+                outputs['logits'].append(torch.Tensor([k for k in generations.logits[batch_item_number]]))
 
         self.tokenizer.padding_side = padding_side_default
         return outputs

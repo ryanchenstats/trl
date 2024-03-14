@@ -9,7 +9,7 @@ class TestNewTrainer(unittest.TestCase):
     def setUp(self) -> None:
         self.trainer = None
         self.tokenizer = AutoTokenizer.from_pretrained('facebook/opt-350m')
-        self.model = AutoModelForCausalLMWithValueHead.from_pretrained('facebook/opt-350m', cache_dir = 'unittest/')
+        self.model = AutoModelForCausalLMWithValueHead.from_pretrained('facebook/opt-350m', cache_dir = 'unit_tests/')
         
         ppo_config = PPOConfig(
             model_name='facebook/opt-350m',
