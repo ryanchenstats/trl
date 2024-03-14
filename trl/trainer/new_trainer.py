@@ -36,6 +36,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+import transformers
 
 from ..core import (
     WANDB_PADDING,
@@ -428,6 +429,30 @@ class NEWTrainer(BaseTrainer):
         else:
             return dataset.remove_columns(ignored_columns)
 
+    def explore_expand_tensors(self, 
+                               query_tensor: torch.Tensor,
+                               num_to_explore: int = 1
+    ):
+        """
+        Generate the expanded queries. We repeat each query `num_to_explore` times. 
+        
+        Args:
+            query_tensor (`torch.LongTensor`):
+                A tensor of shape (unique prompts, input seq len)
+
+            num_to_explore (`int`):
+                Integer denoting how many times each prompt is to be repeated.
+                
+        Returns:
+            List[torch.LongTensor] of input ids of shape num_to_explore * unique_prompts, 
+            each of length input_seq_len containing the repeated queries
+        """
+        
+        query_tensor = query_tensor.repeat_interleave(repeats=num_to_explore, dim=0)
+        query_tensor = list(query_tensor)
+        return query_tensor
+        
+    
     def generate(
         self,
         query_tensor: Union[torch.Tensor, List[torch.Tensor]],
@@ -435,6 +460,7 @@ class NEWTrainer(BaseTrainer):
         batch_size: int = 4,
         return_prompt: bool = True,
         generate_ref_response: bool = False,
+        num_to_explore: int = 1,
         **generation_kwargs,
     ):
         """
@@ -460,6 +486,9 @@ class NEWTrainer(BaseTrainer):
         """
         if generate_ref_response:
             ref_model = self.model if self.is_peft_model else self.ref_model
+        
+        query_tensor = self.explore_expand_tensors(query_tensor=query_tensor, num_to_explore=num_to_explore)
+        
         if isinstance(query_tensor, List):
             response = self._generate_batched(
                 self.model,
@@ -504,6 +533,10 @@ class NEWTrainer(BaseTrainer):
             return response, ref_response
         return response
 
+    def _accelerate_model(self, model, padded_inputs, **generation_kwargs,) -> transformers.PreTrainedModel:
+        generator_out = self.accelerator.unwrap_model(model).generate(**padded_inputs, **generation_kwargs)
+        return generator_out
+    
     def _generate_batched(
         self,
         model: PreTrainedModelWrapper,
@@ -515,7 +548,7 @@ class NEWTrainer(BaseTrainer):
         remove_padding: bool = True,
         **generation_kwargs,
     ):
-        outputs = []
+        outputs = {'output_ids': [], 'logits': []}
 
         padding_side_default = self.tokenizer.padding_side
         if not self.is_encoder_decoder:
@@ -534,7 +567,14 @@ class NEWTrainer(BaseTrainer):
             batch = query_tensors[i:end_index]
             batch_mask = [torch.ones_like(element) for element in batch]
             inputs = {"input_ids": batch, "attention_mask": batch_mask}
-
+            """
+            inputs is now 
+            {
+                'input_ids': List[torch.Tensor], each tensor is an item of the input. List of length batch_size
+                'attention_map': same as above, but each tensor is [1,...,1] of same length as the input
+            }
+            """
+            
             padded_inputs = self.tokenizer.pad(
                 inputs,
                 padding=True,
@@ -542,15 +582,24 @@ class NEWTrainer(BaseTrainer):
                 pad_to_multiple_of=pad_to_multiple_of,
                 return_tensors="pt",
             ).to(self.current_device)
+            
+            # see https://huggingface.co/docs/transformers/v4.38.2/en/internal/generation_utils#transformers.generation.GenerateDecoderOnlyOutput
+            generations = self._accelerate_model(model, **padded_inputs, **generation_kwargs)
 
-            generations = self.accelerator.unwrap_model(model).generate(**padded_inputs, **generation_kwargs)
-
-            for generation, mask in zip(generations, padded_inputs["attention_mask"]):
+            """ 
+            `generations` contains `.logits` and `.sequences`
+                generations.logits is tuple of size `max_new_tokens`
+                    generations.logits[k] is logits of the k-th token.
+                    so it is of shape (batch_size, vocabulary_size)
+                generations.sequences is a tensor of size (batch_size, query+response_size)
+            """
+            
+            for generation, mask in zip(generations.sequences, padded_inputs["attention_mask"]):
                 if not self.is_encoder_decoder:
                     output = generation[(1 - mask).sum() :]  # remove padding
                 else:
                     output = generation
-
+                output = output[1:]
                 if not return_prompt and not self.is_encoder_decoder:
                     output = output[(mask).sum() :]  # remove prompt
 
@@ -559,7 +608,10 @@ class NEWTrainer(BaseTrainer):
                     pad_start = torch.nonzero(pad_mask, as_tuple=False)[0, 0].item()
                     output = output[: pad_start + 1]  # keep the eos token at the end
 
-                outputs.append(output)
+                outputs['output_ids'].append(output)
+            
+            for token_logits in list(generations.logits):
+                pass
 
         self.tokenizer.padding_side = padding_side_default
         return outputs
