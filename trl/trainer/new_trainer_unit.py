@@ -120,6 +120,6 @@ class TestNewTrainer(unittest.TestCase):
             
         }
         resp = self.trainer.generate(query_tensor=query_ids['input_ids'], num_to_explore=num_to_explore, **generation_kwargs)
-        # print(resp)
+        print(resp)
             
     
