@@ -488,6 +488,7 @@ class NEWTrainer(BaseTrainer):
             ref_model = self.model if self.is_peft_model else self.ref_model
         
         query_tensor = self.explore_expand_tensors(query_tensor=query_tensor, num_to_explore=num_to_explore)
+        query_tensor = list(query_tensor)
         
         if isinstance(query_tensor, List):
             response = self._generate_batched(
