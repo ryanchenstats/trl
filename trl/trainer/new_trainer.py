@@ -152,6 +152,7 @@ class NEWTrainer(BaseTrainer):
         data_collator: Optional[typing.Callable] = None,
         num_shared_layers: Optional[int] = None,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        num_to_explore: int = 1,
     ):
         """
         Initialize PPOTrainer.
@@ -180,7 +181,8 @@ class NEWTrainer(BaseTrainer):
                 Learning rate scheduler used for training.
         """
         super().__init__(config)
-
+        self.num_to_explore = config.num_explore_k
+        
         # initial seed for reproducible experiments
         set_seed(config.seed)
 
@@ -430,8 +432,7 @@ class NEWTrainer(BaseTrainer):
             return dataset.remove_columns(ignored_columns)
 
     def explore_expand_tensors(self, 
-                               query_tensor: torch.Tensor,
-                               num_to_explore: int = 1
+                               query_tensor: torch.Tensor
     ):
         """
         Generate the expanded queries. We repeat each query `num_to_explore` times. 
@@ -440,15 +441,12 @@ class NEWTrainer(BaseTrainer):
             query_tensor (`torch.LongTensor`):
                 A tensor of shape (unique prompts, input seq len)
 
-            num_to_explore (`int`):
-                Integer denoting how many times each prompt is to be repeated.
-                
         Returns:
             List[torch.LongTensor] of input ids of shape num_to_explore * unique_prompts, 
             each of length input_seq_len containing the repeated queries
         """
-        
-        query_tensor = query_tensor.repeat_interleave(repeats=num_to_explore, dim=0)
+        # num_to_explore is dictated in the config, processed in the __init__()
+        query_tensor = query_tensor.repeat_interleave(repeats=self.num_to_explore, dim=0)
         query_tensor = list(query_tensor)
         return query_tensor
         
@@ -460,7 +458,6 @@ class NEWTrainer(BaseTrainer):
         batch_size: int = 4,
         return_prompt: bool = True,
         generate_ref_response: bool = False,
-        num_to_explore: int = 1,
         **generation_kwargs,
     ):
         """
@@ -482,12 +479,15 @@ class NEWTrainer(BaseTrainer):
                 Keyword arguments for generation.
 
         Returns:
-            `torch.LongTensor`: A tensor of shape (`batch_size`, `gen_len`) containing response tokens.
+            Dict of:
+                'query_ids': List[torch.Tensor] of length `batch_size`. Each item is a tensor of `input_ids`
+                'output_ids': List[torch.Tensor] of length `batch_size`. Each item is a tensor of `output_ids`
+                'logits': List[torch.Tensor] of length `batch_size`. Each item is a tensor of size [output_ids, vocab_size]
         """
         if generate_ref_response:
             ref_model = self.model if self.is_peft_model else self.ref_model
         
-        query_tensor = self.explore_expand_tensors(query_tensor=query_tensor, num_to_explore=num_to_explore)
+        query_tensor = self.explore_expand_tensors(query_tensor=query_tensor)
         query_tensor = list(query_tensor)
         
         if isinstance(query_tensor, List):
@@ -499,6 +499,7 @@ class NEWTrainer(BaseTrainer):
                 return_prompt=return_prompt,
                 **generation_kwargs,
             )
+            response['query_ids'] = query_tensor
             if generate_ref_response:
                 with self.optional_peft_ctx():
                     ref_response = self._generate_batched(
@@ -509,6 +510,7 @@ class NEWTrainer(BaseTrainer):
                         return_prompt=return_prompt,
                         **generation_kwargs,
                     )
+                    ref_response['query_ids'] = query_tensor
 
         else:
             if len(query_tensor.shape) == 2:
@@ -585,7 +587,7 @@ class NEWTrainer(BaseTrainer):
             ).to(self.current_device)
             
             # see https://huggingface.co/docs/transformers/v4.38.2/en/internal/generation_utils#transformers.generation.GenerateDecoderOnlyOutput
-            generations = self._accelerate_model(model, **padded_inputs, **generation_kwargs)
+            generations = self._accelerate_model(model, padded_inputs, **generation_kwargs)
 
             """ 
             `generations` contains `.logits` and `.sequences`
@@ -612,7 +614,7 @@ class NEWTrainer(BaseTrainer):
                 outputs['output_ids'].append(output)
             
             for batch_item_number in range(batch_size):
-                outputs['logits'].append(torch.Tensor([k for k in generations.logits[batch_item_number]]))
+                outputs['logits'].append(torch.stack([generations.logits[k][batch_item_number] for k in range(generation_kwargs['max_new_tokens'])]))
 
         self.tokenizer.padding_side = padding_side_default
         return outputs
@@ -666,6 +668,88 @@ class NEWTrainer(BaseTrainer):
                 scores[i] = score.squeeze()
 
         return queries, responses, scores, masks
+
+    def new_loss(self, response_probs, ref_response_probs, rewards, rewards_ref, beta, gamma):
+        """
+        Soft cross entropy with old and new responses
+        
+        All inputs are torch.Tensor of shape (batch_size, *)
+        Args:
+            beta (`float`):
+                Temperature parameter for probabilities
+            gamma (`float`):
+                Temperature parameter for reward scaling
+        """
+        bs = len(rewards)
+        y = torch.zeros_like(response_probs)
+        for k in range(0, bs, self.num_to_explore):
+            batch_start = k
+            batch_end = min(k + self.num_to_explore, bs)
+            ref_sum = torch.sum(torch.mul(torch.pow(ref_response_probs[batch_start:batch_end], beta), torch.exp(rewards_ref[batch_start:batch_end].unsqueeze(-1) / gamma)), dim=0)
+            ref_prob = torch.mul(torch.pow(ref_response_probs[batch_start:batch_end], beta), torch.exp(rewards_ref[batch_start:batch_end].unsqueeze(-1) / gamma))
+            y[batch_start:batch_end] = ref_prob / ref_sum
+        
+        print(torch.sum(y, dim=0))
+        
+        print(y)
+        print(y.shape)
+        
+    
+    @PPODecorators.empty_device_cache()
+    def new_step(
+        self,
+        response_logits,
+        ref_response_logits,
+        rewards,
+        rewards_ref,
+        # response_masks
+    ):
+        """
+        Run an optimisation step given a list of queries, model response logits, and rewards.
+
+        Lists are of size `batch_size`
+        Args:
+            queries (List[`torch.LongTensor`]):
+                List of tensors containing the encoded queries of shape (`query_length`)
+            responses (List[`torch.LongTensor`]):
+                List of tensors containing the encoded responses of shape (`response_length`) from new model
+            response_logits (List[`torch.LongTensor`]):
+                List of tensors containing the response logits of shape (`response_length`)
+            ref_response_logits (List[`torch.LongTensor`]):
+                List of tensors containing the response logits of shape (`response_length`) from ref model
+            rewards (List[`torch.FloatTensor`]):
+                List of tensors containing the rewards.
+            response_masks (List[`torch.FloatTensor`], *optional*)):
+                List of tensors containing masks of the response tokens.
+
+        Returns:
+            `dict[str, Any]`: A summary of the training statistics
+        """
+        bs = self.config.batch_size
+        if len(response_logits) != bs:
+            bs = len(response_logits)
+            
+
+        # queries, responses, scores, response_masks = self._step_safety_checker(
+        #     bs, queries, responses, scores, response_masks
+        # )
+        # scores = torch.tensor(scores, device=self.current_device)
+        
+        probs = []
+        ref_probs = []
+        for k in range(bs):
+            probs.append(F.softmax(response_logits[k], dim=-1))
+            ref_probs.append(F.softmax(ref_response_logits[k], dim=-1))
+        
+        rewards = torch.stack(rewards)
+        ref_rewards = torch.stack(rewards_ref)
+        probs = torch.stack(probs)
+        ref_probs = torch.stack(ref_probs)
+        
+        self.new_loss(response_probs=probs, ref_response_probs=ref_probs, rewards=rewards, rewards_ref=ref_rewards, beta=1, gamma=1)
+        
+        
+        pass
 
     @PPODecorators.empty_device_cache()
     def step(
@@ -728,6 +812,7 @@ class NEWTrainer(BaseTrainer):
 
         t = time.time()
 
+        # convert queries and responses into {input_ids, attention_masks}
         model_inputs = self.prepare_model_inputs(queries, responses)
 
         if self.is_distributed:
